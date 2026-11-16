@@ -1,0 +1,270 @@
+--Q1. What are the total revenue, total delivered orders, total units sold and average order value (AOV) for the business?
+
+select
+       extract(year from o.order_date) as order_year,
+       sum(oi.line_total) as total_revenue, count(o.order_id) as count_orders,
+       sum(oi.quantity) as total_units,
+       round(sum(oi.line_total)/count(o.order_id),2) as AOV
+from orders o join order_items oi on  o.order_id=oi.order_id
+         group by extract(year from o.order_date) 
+
+--Q2. How is revenue changing month over month? Identify the months with the highest and lowest revenue and calculate month-over-month growth.
+
+
+WITH monthly_revenue AS (
+    SELECT
+DATE_TRUNC('month', o.order_date)::DATE AS month,
+SUM(oi.line_total) AS revenue
+FROM orders o
+INNER JOIN order_items oi
+ON o.order_id = oi.order_id
+WHERE o.order_status = 'Delivered'
+GROUP BY DATE_TRUNC('month', o.order_date)::DATE
+),
+
+-- Generate all months in the order date range
+month_series AS (
+    SELECT
+        GENERATE_SERIES(
+            DATE_TRUNC('month', MIN(order_date)),
+            DATE_TRUNC('month', MAX(order_date)),
+            INTERVAL '1 month'
+        )::DATE AS month
+    FROM orders
+),
+
+-- Include months with zero delivered revenue
+monthly_summary AS (
+SELECT
+ms.month,
+COALESCE(mr.revenue, 0) AS monthly_revenue
+FROM month_series ms
+LEFT JOIN monthly_revenue mr
+ ON ms.month = mr.month
+),
+
+-- Calculate previous month's revenue
+revenue_comparison AS (
+    SELECT
+ month,
+monthly_revenue,LAG(monthly_revenue) OVER (
+ORDER BY month
+) AS previous_month_revenue
+FROM monthly_summary
+),
+
+-- Calculate month-over-month growth
+final_analysis AS (
+    SELECT
+        month,
+        monthly_revenue,
+        previous_month_revenue,
+
+        monthly_revenue - previous_month_revenue
+            AS revenue_change,
+
+        ROUND(
+            (
+                (monthly_revenue - previous_month_revenue)
+                / NULLIF(previous_month_revenue, 0)
+            ) * 100,
+            2
+        ) AS mom_growth_percentage
+
+    FROM revenue_comparison
+)
+
+SELECT
+    TO_CHAR(month, 'Mon YYYY') AS month,
+    monthly_revenue,
+    previous_month_revenue,
+    revenue_change,
+    mom_growth_percentage,
+
+    CASE
+        WHEN monthly_revenue = MAX(monthly_revenue) OVER()
+        THEN 'Highest Revenue'
+        WHEN monthly_revenue = MIN(monthly_revenue) OVER()
+        THEN 'Lowest Revenue'
+        ELSE 'Normal'
+    END AS revenue_performance
+
+FROM final_analysis
+ORDER BY month;
+
+
+--Q3. Order status analysis.What percentage of total orders are delivered, cancelled and returned? Are there any concerning trends in order fulfilment?
+
+select 
+      extract(year from order_date) as order_year,
+      order_status, count(order_status) 
+from orders
+      group by order_status,extract(year from order_date)
+
+
+--Q4.Which are the top 10 products generating the highest revenue, and how many units has each sold?
+
+with product_stats as 
+(
+select 
+      p.product_name as product,
+      sum(oi.line_total) as revenue_generated, 
+      sum(oi.quantity) as total_units,
+      rank() over(order by sum(oi.line_total) desc) as rnk
+      from order_items oi 
+      right join products p on oi.product_id=p.product_id
+      group by p.product_name
+      order by sum(oi.line_total) desc
+)
+
+select *
+from
+product_stats
+where rnk<=10
+
+--Q5.Which product categories contribute the highest revenue and what percentage of total revenue does each category contribute?
+
+with category_stats as 
+(
+select
+p.category as category,
+sum(oi.line_total) as category_revenue
+from order_items oi 
+join products p on oi.product_id=p.product_id
+group by p.category
+)
+
+select category,
+round(100*category_revenue/sum (category_revenue) over(),2) as percentage_contribution
+from category_stats
+
+
+--Q6.How many customers are one-time buyers versus repeat buyers? What percentage of customers are repeat buyers?
+
+with repeat_customers as 
+(
+select  
+c.customer_id,count(o.order_id)as no_of_orders
+from customers c 
+left join orders o on c.customer_id=o.customer_id
+group by c.customer_id
+having count(o.order_id)>1
+)
+
+select 
+count(no_of_orders) as repeat_customer
+from repeat_customers
+
+--Q7. Which cities generate the highest revenue, and what is their contribution to total company revenue?
+
+with city_rev as 
+(
+select 
+c.city, sum(oi.line_total) as city_sales 
+from customers c join orders o on c.customer_id=o.customer_id
+join order_items oi on oi.order_id=o.order_id
+group by c.city
+)
+
+select city,
+round(100*city_sales/sum (city_sales) over(),2) as contribution
+from city_rev
+order by contribution desc
+
+--Q8.Which payment methods generate the highest transaction volume ? Calculate the payment success rate for each method.
+
+select * from payments
+
+
+SELECT payment_method,
+COUNT(*) AS total_transactions,
+COUNT(*) FILTER (WHERE payment_status = 'Paid') AS successful_transactions,
+COUNT(*) FILTER ( WHERE payment_status = 'Failed') AS failed_transactions,
+
+ROUND(
+SUM(amount) FILTER ( WHERE payment_status = 'Paid'), 2
+) AS successful_payment_value,
+
+ROUND(
+COUNT(*) FILTER (
+WHERE payment_status = 'Paid') * 100.0 / NULLIF(COUNT(*), 0),2
+) AS payment_success_rate
+
+FROM payments
+GROUP BY payment_method
+ORDER BY successful_payment_value DESC;
+
+--Q9.Identify customers whose monthly spending increased or decreased compared with the previous month. Highlight customers showing declining spending.
+
+
+WITH monthly_customer_spending AS (
+
+    -- Calculate monthly spending for each customer
+SELECT
+o.customer_id,
+DATE_TRUNC('month', o.order_date)::DATE AS month,
+SUM(oi.line_total) AS monthly_spending
+FROM orders o
+INNER JOIN order_items oi
+ON o.order_id = oi.order_id
+WHERE o.order_status = 'Delivered'
+GROUP BY
+ o.customer_id,
+DATE_TRUNC('month', o.order_date)::DATE
+),
+
+customer_spending_comparison AS (
+
+    -- Get previous month's spending
+SELECT
+customer_id,
+month,
+monthly_spending,
+LAG(monthly_spending) OVER (
+PARTITION BY customer_id
+ORDER BY month
+) AS previous_month_spending
+FROM monthly_customer_spending
+),
+spending_analysis AS (
+
+    -- Calculate spending changes
+    SELECT
+customer_id,
+month,
+monthly_spending,
+previous_month_spending,
+monthly_spending - previous_month_spending
+AS spending_change,
+ROUND(
+(monthly_spending - previous_month_spending)
+ * 100.0 /
+NULLIF(previous_month_spending, 0),
+2) AS spending_change_percentage
+FROM customer_spending_comparison
+)
+
+SELECT
+    customer_id,
+    month,
+    monthly_spending,
+    previous_month_spending,
+    spending_change,
+    spending_change_percentage,
+
+CASE
+WHEN previous_month_spending IS NULL
+THEN 'First Purchase Month'
+
+WHEN monthly_spending > previous_month_spending
+THEN 'Increased Spending'
+
+WHEN monthly_spending < previous_month_spending
+ THEN 'Decreased Spending'
+
+ELSE 'No Change'
+END AS spending_trend
+FROM spending_analysis
+ORDER BY
+customer_id,
+month;
